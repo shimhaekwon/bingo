@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>노출 빈도 시뮬레이션</title>
+
+  <!-- 스타일 -->
+  <link rel="stylesheet" href="css/styles.css" />
+
+  <!-- 데이터 먼저 로드 (numChosen 전역 준비) -->
+  <script src="data.js" defer></script>
+
+  <!-- 애플리케이션 스크립트 -->
+  <script src="script.js" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <h1>노출 빈도 시뮬레이션</h1>
+  </header>
+
+  <section class="controls" aria-label="설정">
+    <!-- 차수(윈도우) -->
+    <label for="totalRounds" class="control">
+      차수 크기
+      <select id="totalRounds">
+        <option value="8">8</option>
+        <option value="15">15</option>
+        <option value="30" selected>30</option>
+        <option value="45">45</option>
+        <option value="90">90</option>
+        <option value="180">180</option>
+      </select>
+    </label>
+
+    <!-- 적용 회차 (비우면 최신 회차로 자동 설정) -->
+    <label for="applyRound" class="control">
+      적용회차
+      <input id="applyRound" type="number" inputmode="numeric" placeholder="예: 1194" />
+    </label>
+
+    <!-- 후보 개수: 6~15 -->
+    <label for="candidateCount" class="control">
+      후보 개수
+      <input id="candidateCount" type="number" min="6" max="15" step="1" value="10" />
+    </label>
+
+    <!-- 모드: 예측/복기(선택) -->
+    <label for="mode" class="control">
+      모드
+      <select id="mode">
+        <option value="predict" selected>예측</option>
+        <option value="retro">복기</option>
+      </select>
+    </label>
+
+    <!-- 목표: 평균/고적중(선택) -->
+    <label for="objective" class="control">
+      목표
+      <select id="objective">
+        <option value="avg" selected>평균 적중</option>
+        <option value="hiHit">고적중</option>
+      </select>
+    </label>
+
+    <!-- 실행/튜닝 버튼 -->
+    <div class="buttons">
+      <button id="refreshBtn" type="button" title="지금 설정으로 다시 계산">확인하기</button>
+      <button id="tuneBtn" type="button" title="최근 구간으로 자동 튜닝(가중치 최적화)">튜닝</button>
+    </div>
+
+    <small class="hint">
+      Tip: 적용회차는 비워두면 자동으로 최신 회차가 들어갑니다. 차수 예: 8, 15, 30, 45, 90, 180
+    </small>
+  </section>
+
+  <!-- 결과 요약 -->
+  <section id="summary" class="summary" aria-live="polite"></section>
+
+  <!-- 결과 테이블 -->
+  <section class="table-wrap" aria-label="결과 테이블">
+    <div id="table"></div>
+  </section>
+
+  <footer class="app-footer">
+    <small>
+      후보군 생성은 항상 <b>적용회차 직전</b>까지의 데이터로만 계산됩니다(데이터 누수 방지).<br/>
+      전부 0(더미) 회차에서는 후보군/점수 기반 확률화(softmax)로 <b>예상 추출 6개 샘플</b>을 제공합니다.
+    </small>
+  </footer>
+</body>
+</html>
