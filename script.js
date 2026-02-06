@@ -1,480 +1,714 @@
-/*******************************************************
- * script.js (예측 회차 인식 + 미노출 후보군 + 후보군 정규화)
- *******************************************************/
+/* ===========================================================
+ * Front-only Lotto Analyzer (Top/Bottom Layout, Radio Round Pick)
+ * - 모든 연산 브라우저에서 처리
+ * - 분석/예상 계산: 11개 타입(고정) 동시 사용
+ * - 미리보기 타입(드롭다운)은 확인용 패널에만 사용
+ * - 적용회차: 상단 좌측 '실제 데이터' 표의 라디오/셀 클릭으로 지정
+ * - 후보 k, 미노출 N: 6~20
+ * - 세트 수=5(고정), 세트 크기=6(고정)
+ * =========================================================== */
+(function(){
+  // ===== 고정값 =====
+  const FIXED_SET_COUNT = 5;
+  const FIXED_SET_SIZE  = 6;
 
-/* ===================== 전역 캐시/상수 ===================== */
-let CLEANED_DATA = null; // [[round, n1..n6, bonus], ...] (최신 → 오래된 순)
-let ROUND_MIN = null;
-let ROUND_MAX = null;
+  // ===== 전역 상태 =====
+  // [[round, n1..n6, bonus], ...] (중복 최신 유지)
+  // *주의*: 0만 들어있는 회차(아직 미추첨 등)도 그대로 유지/노출
+  let CLEANED   = null;
+  let ROUND_MIN = null;
+  let ROUND_MAX = null;
 
-// [PATCH] 원본의 '전부 0' 회차 추적(예측 회차 인식용)
-let ZERO_ROUNDS = new Set();
-let ZERO_MAX_ROUND = null;
+  // UI 요소
+  let el = {};
 
-const K_MIN = 6;
-const K_MAX = 15;
-const DEFAULT_TOTAL_ROUNDS = 30;
-const DEFAULT_WEIGHTS = { w1: 1.0, w2: 0.3, w3: 0.8, w4: 0.2 };
-const HINT_WEIGHTS = {
-  hiHit7:  { w1: 0.8, w2: 0.0, w3: 1.2, w4: 0.2 },
-  hiHit10: { w1: 1.0, w2: 0.3, w3: 0.8,  w4: 0.2 }
-};
-const TUNED = { k7: null, k10: null };
+  // 하이퍼파라미터
+  const HP = {
+    beta1: 0.6,   // 기본 결손 가중
+    beta2: 0.3,   // 기본 최근성 가중
+    lambda: 0.3,  // 그룹 내부 분배 시 최근성 가중
+    tau: 1.0      // softmax 온도
+  };
 
-/* ===================== 전처리/유틸 ===================== */
-/** 데이터 정제(최초 1회)
- * - 원본 numChosen을 먼저 훑어 '전부 0' 회차 목록(ZERO_ROUNDS) 생성
- * - CLEANED_DATA에는 '전부 0'을 제외하고, 중복 회차는 최신만 유지
- */
-function prepareDataOnce() {
-  if (CLEANED_DATA) return;
+  /* ===================== 유틸/공통 ===================== */
+  function appendLog(msg, cls=""){
+    const box = el.progress;
+    if (!box) return;
+    const line = document.createElement('div');
+    line.className = "line " + cls;
+    line.textContent = msg;
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+  }
+  function clearLog(){ if (el.progress) el.progress.innerHTML = ""; }
+  function debounce(fn, delay = 120) {
+    let t = null;
+    return (...args) => { clearTimeout(t); t = setTimeout(() => fn.apply(null, args), delay); };
+  }
+  function clampInt(v, min, max, fb=min){
+    const n = parseInt(v, 10);
+    if (!Number.isFinite(n)) return fb;
+    return Math.max(min, Math.min(max, n));
+  }
+  function clampRound(v){
+    const n = parseInt(v,10);
+    if (!Number.isFinite(n)) return ROUND_MAX;
+    if (n < ROUND_MIN) return ROUND_MIN;
+    if (n > ROUND_MAX) return ROUND_MAX;
+    return n;
+  }
 
-  // [PATCH] 전부 0 회차 탐지
-  ZERO_ROUNDS = new Set();
-  ZERO_MAX_ROUND = null;
-  for (const row of numChosen) {
-    const round = row[0];
-    const nums = row.slice(1, 8);
-    if (nums.every(n => n === 0)) {
-      ZERO_ROUNDS.add(round);
-      if (ZERO_MAX_ROUND === null || round > ZERO_MAX_ROUND) ZERO_MAX_ROUND = round;
+  /* ===================== 데이터 준비 ===================== */
+  function prepareDataOnce(){
+    console.log("[prepareDataOnce] start");
+    if (CLEANED) { console.log("[prepareDataOnce] already prepared"); return; }
+    if (!window.numChosen || !Array.isArray(window.numChosen) || window.numChosen.length===0){
+      appendLog("data.js의 numChosen을 찾을 수 없습니다.", "err");
+      throw new Error("numChosen missing");
+    }
+
+    // 중복 회차는 "마지막으로 등장한 항목"을 유지하도록 Map으로 집계
+    const byRound = new Map();
+    let rmin = Infinity, rmax = -Infinity;
+
+    for (const row of window.numChosen){
+      const round = row[0];
+      // *** 0만 있는 회차도 그대로 보관/노출합니다. 필터링 없음. ***
+      byRound.set(round, row);
+      if (round < rmin) rmin = round;
+      if (round > rmax) rmax = round;
+    }
+
+    // 회차 내림차순(최신→과거) 정렬: Real Data 테이블 상단이 최신
+    const out = Array.from(byRound.values()).sort((a,b)=>b[0]-a[0]);
+
+    CLEANED   = out;
+    ROUND_MIN = rmin;
+    ROUND_MAX = rmax;
+
+    console.log("[prepareDataOnce] done: rows=", CLEANED.length, "min=", ROUND_MIN, "max=", ROUND_MAX);
+  }
+
+  /* ===================== 타입 생성 ===================== */
+  function makeRangeGroups(N){
+    const base = Math.floor(45/N), extra = 45 % N;
+    const groups = []; let cur = 1;
+    for (let i=0;i<N;i++){
+      const size = base + (i<extra ? 1 : 0), g=[];
+      for (let k=0;k<size;k++) g.push(cur++);
+      groups.push(g);
+    }
+    return groups;
+  }
+  function makeModGroups(N){
+    const groups = Array.from({length:N},()=>[]);
+    for (let n=1;n<=45;n++) groups[(n-1)%N].push(n);
+    return groups;
+  }
+  function makeEndDigit10(){
+    const groups = Array.from({length:10},()=>[]);
+    for (let n=1;n<=45;n++) groups[n%10].push(n);
+    return groups;
+  }
+  function makeSingle45(){ return Array.from({length:45},(_,i)=>[i+1]); }
+  function buildAllAnalysisTypes(){
+    return [
+      { name:"single45", groups: makeSingle45() },
+      { name:"range3",   groups: makeRangeGroups(3) },
+      { name:"range5",   groups: makeRangeGroups(5) },
+      { name:"range6",   groups: makeRangeGroups(6) },
+      { name:"range9",   groups: makeRangeGroups(9) },
+      { name:"range10",  groups: makeRangeGroups(10) },
+      { name:"range15",  groups: makeRangeGroups(15) },
+      { name:"mod3",     groups: makeModGroups(3) },
+      { name:"mod9",     groups: makeModGroups(9) },
+      { name:"mod15",    groups: makeModGroups(15) },
+      { name:"endDigit10", groups: makeEndDigit10() }
+    ];
+  }
+  function buildPreviewType(name){
+    switch(name){
+      case "single45":  return [{ name, groups: makeSingle45() }];
+      case "range3":    return [{ name, groups: makeRangeGroups(3) }];
+      case "range5":    return [{ name, groups: makeRangeGroups(5) }];
+      case "range6":    return [{ name, groups: makeRangeGroups(6) }];
+      case "range9":    return [{ name, groups: makeRangeGroups(9) }];
+      case "range10":   return [{ name, groups: makeRangeGroups(10) }];
+      case "range15":   return [{ name, groups: makeRangeGroups(15) }];
+      case "mod3":      return [{ name, groups: makeModGroups(3) }];
+      case "mod9":      return [{ name, groups: makeModGroups(9) }];
+      case "mod15":     return [{ name, groups: makeModGroups(15) }];
+      case "endDigit10":return [{ name, groups: makeEndDigit10() }];
+      default:          return [{ name:"range3", groups: makeRangeGroups(3) }];
     }
   }
 
-  // 정제 데이터 생성(전부 0 제외, 중복 회차는 최신만)
-  const seen = new Set();
-  const cleaned = [];
-  for (const row of numChosen) {
-    const round = row[0];
-    const nums = row.slice(1, 8);
-    if (seen.has(round)) continue;               // 최신만 유지
-    if (nums.every(n => n === 0)) continue;      // 전부 0은 정제 데이터에서 제외
-    seen.add(round);
-    cleaned.push(row);
-  }
-  CLEANED_DATA = cleaned;
+  /* ===================== 개별 통계(선택 회차 "직전 W회") ===================== */
+  // ✅ 선택 회차 rEnd "자체"는 절대 포함하지 않습니다. (항상 이전 데이터만 분석)
+  function computeIndividualStats(W, rEnd){
+    // 효과 범위: [start, end] = [(rEnd-1)-W+1, (rEnd-1)]
+    const effectiveEnd = rEnd - 1;
+    const start = effectiveEnd - W + 1;
 
-  ROUND_MAX = Math.max(...cleaned.map(r => r[0]));
-  ROUND_MIN = Math.min(...cleaned.map(r => r[0]));
-}
+    const k = Array(46).fill(0);
+    const lastSeen = Array(46).fill(null);
 
-/** 정수 클램핑 */
-function clampInt(val, min, max, fallback = min) {
-  const v = parseInt(val, 10);
-  if (!Number.isFinite(v)) return fallback;
-  return Math.max(min, Math.min(max, v));
-}
-
-/** [PATCH] 회차 클램핑 개선: 다음 회차 & 전부0 회차 허용
- * 허용 상한 = max(ROUND_MAX + 1, ZERO_MAX_ROUND ?? ROUND_MAX)
- */
-function clampRoundOrPredictable(v) {
-  const allowedMax = Math.max(ROUND_MAX + 1, ZERO_MAX_ROUND ?? ROUND_MAX);
-  if (!Number.isFinite(v)) return ROUND_MAX;
-  if (v < ROUND_MIN) return ROUND_MIN;
-  if (v > allowedMax) return allowedMax;
-  return v;
-}
-
-/** r_end(포함)까지의 최근 totalRounds 집계(보너스 0.5) — r_end+1 이후는 절대 포함 X */
-function aggregateCountsUntil(r_end, totalRounds) {
-  const start = r_end - totalRounds + 1;
-  const counts = {};
-  for (let i = 1; i <= 45; i++) counts[i] = 0;
-  for (const [round, n1, n2, n3, n4, n5, n6, bonus] of CLEANED_DATA) {
-    if (round >= start && round <= r_end) {
-      [n1, n2, n3, n4, n5, n6].forEach((n) => { if (n >= 1 && n <= 45) counts[n]++; });
-      if (bonus >= 1 && bonus <= 45) counts[bonus] += 0.5;
-    }
-  }
-  return counts;
-}
-
-/** 히트맵 컬러 */
-function getColor(value, min, max) {
-  if (max === min) return "rgb(230,230,255)";
-  const ratio = (value - min) / (max - min);
-  const red = Math.round(255 * ratio);
-  const blue = Math.round(255 * (1 - ratio));
-  return `rgb(${red},220,${blue})`;
-}
-
-/** 디바운스 */
-function debounce(fn, delay = 150) {
-  let t = null;
-  return (...args) => { clearTimeout(t); t = setTimeout(() => fn.apply(null, args), delay); };
-}
-
-/** 소프트맥스 (수치 안정) */
-function scoresToProbs(scoreMap, tau = 1.0) {
-  const keys = Array.from(scoreMap.keys());
-  const arr  = keys.map(k => scoreMap.get(k));
-  const maxV = Math.max(...arr);
-  const exps = arr.map(v => Math.exp((v - maxV) / tau));
-  const Z = exps.reduce((a,b)=>a+b, 0) || 1;
-  const probs = new Map();
-  keys.forEach((k,i) => probs.set(k, exps[i] / Z));
-  return probs;
-}
-
-/** z-score 정규화 */
-function zNormalize(values) {
-  const n = values.length || 1;
-  const mean = values.reduce((a,b)=>a+b,0) / n;
-  const varc = values.reduce((a,b)=>a + (b-mean)*(b-mean), 0) / n;
-  const std = Math.sqrt(varc) || 1;
-  return values.map(v => (v - mean) / std);
-}
-
-/* ============== 스코어링 기반 후보군(점수 맵 반환) ============== */
-function getScoredCandidatesWithScores(
-  counts,
-  applyData,
-  totalRounds,
-  k = 10,
-  weights = DEFAULT_WEIGHTS,
-  post = { range: true, ending: true, normalize: true } // [PATCH] normalize 기본 on
-) {
-  const round = applyData[0];
-  const end = round - 1; // 항상 r-1까지만 사용
-  const numbers = Array.from({ length: 45 }, (_, i) => i + 1);
-
-  // 직전 회차/인접수
-  const prev = CLEANED_DATA.find((d) => d[0] === round - 1);
-  const prevSet = new Set(prev ? prev.slice(1, 7) : []);
-  const prevAdj = new Set();
-  prevSet.forEach((n) => { if (n > 1) prevAdj.add(n - 1); if (n < 45) prevAdj.add(n + 1); });
-
-  // 마지막 출현 시점 — 적용회차 직전까지
-  const lastSeen = new Map(numbers.map((n) => [n, null]));
-  for (const [r, n1, n2, n3, n4, n5, n6, bonus] of CLEANED_DATA) {
-    if (r > end) continue;
-    [n1, n2, n3, n4, n5, n6].forEach((n) => { if (lastSeen.get(n) === null) lastSeen.set(n, r); });
-    if (bonus && lastSeen.get(bonus) === null) lastSeen.set(bonus, r);
-  }
-
-  const { w1, w2, w3, w4 } = weights;
-  const targetAvg = (totalRounds * 6) / 45;
-
-  // 정규화 준비
-  const deficitRaw = [];
-  const gapRaw = [];
-  for (let n = 1; n <= 45; n++) {
-    const deficit = targetAvg - (counts[n] || 0);
-    const ls = lastSeen.get(n);
-    const gap = (ls !== null) ? (end - ls) : totalRounds;
-    deficitRaw.push(deficit);
-    gapRaw.push(gap / totalRounds);
-  }
-  const useNorm = post && post.normalize !== false;
-  const deficitArr = useNorm ? zNormalize(deficitRaw) : deficitRaw;
-  const gapArr     = useNorm ? zNormalize(gapRaw)     : gapRaw;
-
-  // 점수 계산
-  const score = new Map();
-  for (let n = 1; n <= 45; n++) {
-    const idx = n - 1;
-    let s = 0;
-    s += w1 * deficitArr[idx];
-    s += w2 * gapArr[idx];
-    if (prevSet.has(n)) s += w3;
-    if (prevAdj.has(n)) s += w4;
-    score.set(n, s);
-  }
-
-  // 상위 k 1차 선별
-  const ranked = Array.from(score.keys()).sort(
-    (a, b) => (score.get(b) - score.get(a)) || (a - b)
-  );
-  const cand = new Set(ranked.slice(0, k));
-
-  // 구간 커버
-  if (post?.range) {
-    [[1,15],[16,30],[31,45]].forEach(([a,b]) => {
-      if (![...cand].some(n => a <= n && n <= b)) {
-        const add = ranked.find(n => n>=a && n<=b && !cand.has(n));
-        if (add) {
-          cand.add(add);
-          if (cand.size > k) {
-            const drop = [...cand]
-              .filter(x => !(a<=x&&x<=b))
-              .sort((x,y) => (score.get(x)-score.get(y)) || (x-y))[0];
-            if (drop) cand.delete(drop);
-          }
+    for (const row of CLEANED){
+      const [round,n1,n2,n3,n4,n5,n6,bonus] = row;
+      if (round < start || round > effectiveEnd) continue;
+      const arr=[n1,n2,n3,n4,n5,n6];
+      for (const n of arr){
+        if (n>=1 && n<=45){
+          k[n] += 1;
+          if (lastSeen[n]===null || lastSeen[n] < round) lastSeen[n] = round;
         }
       }
+      if (Number.isFinite(bonus) && bonus>=1 && bonus<=45){
+        k[bonus] += 0.5;
+        if (lastSeen[bonus]===null || lastSeen[bonus] < round) lastSeen[bonus] = round;
+      }
+    }
+
+    const recency = Array(46).fill(0);
+    for (let n=1;n<=45;n++){
+      recency[n] = (lastSeen[n]===null) ? W : (effectiveEnd - lastSeen[n]);
+    }
+    return { k, recency, range: {start, end: effectiveEnd} };
+  }
+
+  /* ===================== 관측치 O(t,g) (선택 회차 "직전 W회") ===================== */
+  function computeObserved(W, rEnd, types){
+    const effectiveEnd = rEnd - 1;
+    const start = effectiveEnd - W + 1;
+
+    const O = {};
+    const mapIndex = {};
+    for (const t of types){
+      const idx = Array(46).fill(-1);
+      t.groups.forEach((grp, gi)=>{ for (const n of grp) idx[n] = gi; });
+      mapIndex[t.name] = idx;
+      O[t.name] = Array(t.groups.length).fill(0);
+    }
+    for (const row of CLEANED){
+      const [round,n1,n2,n3,n4,n5,n6] = row;
+      if (round < start || round > effectiveEnd) continue;
+      const arr=[n1,n2,n3,n4,n5,n6];
+      for (const t of types){
+        const idx = mapIndex[t.name];
+        for (const n of arr){
+          const gi = idx[n];
+          if (gi>=0) O[t.name][gi]++;
+        }
+      }
+    }
+    return O;
+  }
+
+  /* ===================== 유형 통계/가중치 ===================== */
+  function computeTypeStats(W, types, O){
+    const info = [];
+    for (const t of types){
+      const E  = t.groups.map(g => W * 6 * (g.length/45));
+      const SR = O[t.name].map((o,i) => (o - E[i]) / Math.sqrt(E[i] + 1e-9));
+      const s  = SR.map(x => -x);
+      let chi2 = 0;
+      for (let i=0;i<E.length;i++){
+        chi2 += Math.pow(O[t.name][i]-E[i],2) / (E[i]+1e-9);
+      }
+      info.push({ name:t.name, groups:t.groups, O:O[t.name], E, SR, s, chi2 });
+    }
+    const sumChi = info.reduce((a,b)=>a+b.chi2,0) || 1e-9;
+    info.forEach(x => x.alpha = x.chi2 / sumChi);
+    return info;
+  }
+
+  function zNormalize(arr){
+    const n    = arr.length || 1;
+    const mean = arr.reduce((a,b)=>a+b,0)/n;
+    const varc = arr.reduce((a,b)=>a+(b-mean)*(b-mean),0)/n;
+    const std  = Math.sqrt(varc) || 1;
+    return arr.map(v => (v-mean)/std);
+  }
+
+  /* ===================== 번호 점수 S(n) ===================== */
+  function scoreNumbers(W, rEnd, typeInfo, k, recency){
+    const mu = W*6/45;
+    const deficit = Array.from({length:46},(_,n)=> (n===0?0 : (mu - (k[n]||0))));
+    const deficitZ = zNormalize(deficit.slice(1)); deficitZ.unshift(0);
+    const recZ     = zNormalize(recency.slice(1)); recZ.unshift(0);
+    const S = Array(46).fill(0);
+
+    for (const ti of typeInfo){
+      const alpha = ti.alpha;
+      for (let gi=0; gi<ti.groups.length; gi++){
+        const grp = ti.groups[gi];
+        const weights = grp.map(n => deficitZ[n] + HP.lambda*recZ[n]);
+        const Z = weights.reduce((a,b)=>a+b,0) || 1e-9;
+        const s_g = ti.s[gi];
+        for (let idx=0; idx<grp.length; idx++){
+          const n = grp[idx];
+          const share = weights[idx]/Z;
+          S[n] += alpha * s_g * share;
+        }
+      }
+    }
+    for (let n=1;n<=45;n++){
+      S[n] += HP.beta1*deficitZ[n] + HP.beta2*recZ[n];
+    }
+    return S;
+  }
+
+  /* ===================== 확률/후보/세트 ===================== */
+  function softmaxFromScores(S){
+    const arr  = [];
+    for (let n=1;n<=45;n++) arr.push(S[n]);
+    const maxV = Math.max(...arr);
+    const exps = arr.map(v => Math.exp((v - maxV)/HP.tau));
+    const Z    = exps.reduce((a,b)=>a+b,0) || 1;
+    const P    = Array(46).fill(0);
+    for (let n=1;n<=45;n++) P[n] = exps[n-1]/Z;
+    return P;
+  }
+  function topKFromScores(S, k){
+    const arr = [];
+    for (let n=1;n<=45;n++) arr.push([n, S[n]]);
+    arr.sort((a,b)=> (b[1]-a[1]) || (a[0]-b[0]));
+    const picked = arr.slice(0, k).map(x => x[0]).sort((a,b)=>a-b);
+    return new Set(picked);
+  }
+  function sampleNoReplace(weightsMap, drawCount){
+    const nums = []; const weights=[];
+    for (let n=1;n<=45;n++){
+      const w = weightsMap[n]||0; if (w<=0) continue;
+      nums.push(n); weights.push(w);
+    }
+    const picked = [];
+    let total = weights.reduce((a,b)=>a+b,0);
+    for (let t=0;t<drawCount && nums.length>0;t++){
+      let r = Math.random()*total, i=0;
+      while (i<weights.length && r>weights[i]){ r-=weights[i]; i++; }
+      if (i>=weights.length) i = weights.length-1;
+      picked.push(nums[i]);
+      total -= weights[i];
+      nums.splice(i,1); weights.splice(i,1);
+    }
+    picked.sort((a,b)=>a-b);
+    return picked;
+  }
+  function buildExposureSets(P, setsCount, setSize, dedup){
+    const sets = [];
+    const used = new Set();
+    for (let s=0;s<setsCount;s++){
+      const local = Array(46).fill(0);
+      for (let n=1;n<=45;n++){
+        local[n] = (dedup && used.has(n)) ? 1e-12 : (P[n]||0);
+      }
+      const one = sampleNoReplace(local, setSize);
+      sets.push(one);
+      if (dedup) one.forEach(n => used.add(n));
+    }
+    return sets;
+  }
+
+  /* ===================== 렌더 보조 ===================== */
+  function getHeat(min, max, v){
+    if (max===min) return 'rgb(230,230,255)';
+    const t = (v - min) / (max - min);
+    const red  = Math.round(255*t);
+    const blue = Math.round(255*(1-t));
+    return `rgb(${red},220,${blue})`;
+  }
+  function applyColumnSeparators(tableHost){
+    const tableEl = tableHost?.querySelector("table"); if (!tableEl) return;
+    const sepIdx = new Set([5,10,15,20,25,30,35,40]);
+    const rows = tableEl.rows;
+    for (let r=0;r<rows.length;r++){
+      const cells = rows[r].children;
+      for (let c=0;c<cells.length;c++){
+        const colIndex = c+1;
+        if (sepIdx.has(colIndex)) cells[c].classList.add('col-sep');
+        if (colIndex===45)        cells[c].classList.add('last-col');
+      }
+    }
+  }
+  function enableColumnHoverBand(tableHost){
+    const tableEl = tableHost?.querySelector("table"); if (!tableEl) return;
+    let hoverCol = null;
+    function setHover(col){
+      if (hoverCol===col) return;
+      clearHover(); hoverCol=col;
+      if (!Number.isInteger(col) || col<1) return;
+      const rows = tableEl.rows;
+      for (let r=0;r<rows.length;r++){
+        const cell = rows[r].children[col-1];
+        if (cell) cell.classList.add('col-hover');
+      }
+    }
+    function clearHover(){
+      const prev = tableEl.querySelectorAll('.col-hover');
+      prev.forEach(n=>n.classList.remove('col-hover'));
+      hoverCol=null;
+    }
+    tableEl.addEventListener('mousemove', (e)=>{
+      const cell = e.target.closest('td,th');
+      if (!cell || !tableEl.contains(cell)){ clearHover(); return; }
+      const col = Array.prototype.indexOf.call(cell.parentNode.children, cell)+1;
+      setHover(col);
+    });
+    tableEl.addEventListener('mouseleave', clearHover);
+  }
+  function findApplyRow(round) {
+    if (!CLEANED) return null;
+    const row = CLEANED.find(r => r[0] === round);
+    return row || null;
+  }
+
+  /* ===================== Data Viewer (라디오/셀 클릭) ===================== */
+  function renderDataViewer(){
+    const host = document.getElementById('dataViewerInner');
+    if (!host || !CLEANED) return;
+    host.innerHTML = "";
+
+    // ✅ 모든 회차 표시 (자르지 않음). 최신→과거 정렬은 CLEANED에서 보장.
+    const rows = CLEANED;
+
+    let html = "<table><thead><tr><th class='col-radio'>선택</th><th>회차</th><th colspan='6'>당첨번호</th><th>보너스</th></tr></thead><tbody>";
+    const cur = parseInt(el.applyRound.value || ROUND_MAX, 10);
+    for (const [round,n1,n2,n3,n4,n5,n6,bonus] of rows){
+      const checked = (round === cur) ? "checked" : "";
+      const view = v => (v && Number.isFinite(v) && v>0) ? v : "-"; // 0은 보기상 '-'
+      html += `<tr data-round="${round}">
+        <td><input type="radio" name="roundPick" value="${round}" ${checked}/></td>
+        <td>${round}</td>
+        <td>${view(n1)}</td><td>${view(n2)}</td><td>${view(n3)}</td><td>${view(n4)}</td><td>${view(n5)}</td><td>${view(n6)}</td>
+        <td>${view(bonus)}</td>
+      </tr>`;
+    }
+    html += "</tbody></table>";
+    host.innerHTML = html;
+
+    // 라디오 변경 → 적용회차 설정 & 즉시 렌더
+    host.querySelectorAll('input[type="radio"][name="roundPick"]').forEach(radio=>{
+      radio.addEventListener('change', ()=>{
+        const r = parseInt(radio.value, 10);
+        if (!Number.isFinite(r)) return;
+        el.applyRound.value = r;
+        host.querySelectorAll('tbody tr').forEach(x=>x.classList.remove('sel'));
+        const tr = radio.closest('tr'); tr?.classList.add('sel');
+        appendLog(`회차 ${r} 선택 → 분석 갱신(선택 회차 제외, 직전 W회)`, "ok");
+        renderAll();
+      });
+    });
+
+    // 라디오 외 '셀' 클릭 → 해당 회차 선택
+    host.addEventListener('click', (e) => {
+      if (e.target.matches('input[type="radio"][name="roundPick"]')) return; // 라디오는 기존 핸들러
+      const cell = e.target.closest('td');
+      const tr   = e.target.closest('tr[data-round]');
+      if (!cell || !tr) return;
+      const r = parseInt(tr.dataset.round, 10);
+      if (!Number.isFinite(r)) return;
+      host.querySelector(`input[type="radio"][name="roundPick"][value="${r}"]`)?.click();
     });
   }
 
-  // 끝자리 다양성(같은 끝자리 최대 2개)
-  if (post?.ending) {
-    const endCount = {};
-    for (const n of [...cand]) {
-      const e = n % 10;
-      endCount[e] = (endCount[e] || 0) + 1;
-    }
-    for (const e in endCount) {
-      if (endCount[e] > 2) {
-        const overs = [...cand]
-          .filter(n => n % 10 === (+e))
-          .sort((x,y) => (score.get(x)-score.get(y)) || (x-y));
-        while (overs.length > 2) cand.delete(overs.shift());
+  /* ===================== Type Rate 패널 (툴팁/요약표시) ===================== */
+  function renderTypePanel(typeInfo){
+    const host = el.typePanel; if (!host) return;
+    host.innerHTML = ""; // 중복 렌더 방지
+
+    for (const t of typeInfo){
+      // 카드
+      const card = document.createElement('div');
+      card.className = "type-card";
+
+      // 제목
+      const h3 = document.createElement('h3');
+      h3.textContent = `Type: ${t.name} · χ²=${t.chi2.toFixed(2)} · α=${t.alpha.toFixed(3)}`;
+      card.appendChild(h3);
+
+      // 표
+      const tbl  = document.createElement('table');
+      const thead = document.createElement('thead');
+      thead.innerHTML = `
+        <tr>
+          <th title="#: 그룹 번호 (1부터). 선택한 타입의 구간/나머지/끝수 등으로 묶인 Group Index">#</th>
+          <th title="Observed: 관측 횟수">O</th>
+          <th title="Expected: 기대 횟수 (비율 기반)">E</th>
+          <th title="Standardized Residual: (O-E)/sqrt(E)">SR</th>
+          <th title="s = -SR (가중 방향)">s=-SR</th>
+        </tr>`;
+      tbl.appendChild(thead);
+
+      const tbody = document.createElement('tbody');
+      for (let gi=0; gi<t.groups.length; gi++){
+        const nums = t.groups[gi];                 // 이 그룹에 포함된 번호 목록
+        const fullList  = nums.join(', ');
+        const shortList = nums.length > 12 ? nums.slice(0,12).join(', ') + ' …' : fullList;
+
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td title="포함 번호: ${fullList}">
+            ${gi+1}
+            <div style="font-size:11px;color:#757575;white-space:normal;line-height:1.25;margin-top:2px">${shortList}</div>
+          </td>
+          <td>${t.O[gi]}</td>
+          <td>${t.E[gi].toFixed(2)}</td>
+          <td>${t.SR[gi].toFixed(2)}</td>
+          <td>${t.s[gi].toFixed(2)}</td>
+        `;
+        tbody.appendChild(tr);
       }
+      tbl.appendChild(tbody);
+      card.appendChild(tbl);
+      host.appendChild(card);
     }
-    if (cand.size < k) {
-      for (const n of ranked) { if (cand.size >= k) break; cand.add(n); }
+  }
+
+  /* ===================== 메인 렌더 ===================== */
+  function renderAll(){
+    clearLog();
+    appendLog("데이터 준비 중…");
+    prepareDataOnce();
+
+    // 입력값/가드
+    const W   = clampInt(el.totalRounds.value, 1, 180, 30);
+    const rIn = parseInt(el.applyRound.value || ROUND_MAX, 10);
+    const r   = Number.isFinite(rIn) ? clampRound(rIn) : ROUND_MAX;
+    el.applyRound.value = r;
+    const k    = clampInt(el.candidateCount.value, 6, 20, 12);
+    const nonN = clampInt(el.nonExposeCount.value, 6, 20, 10);
+    const dedup = true;
+
+    // 분석 범위는 [ (r-1)-W+1  ~  (r-1) ] 이므로, 시작이 데이터 최솟값보다 작으면 경고
+    const effEnd = r - 1;
+    const effStart = effEnd - W + 1;
+    if (effStart < ROUND_MIN){
+      appendLog(`집계 범위(${effStart}~${effEnd})가 데이터 시작(${ROUND_MIN})보다 앞섭니다. 차수를 줄이거나 적용회차를 올려주세요.`, "warn");
+      return;
     }
+
+    // 요약 (선택 회차 제외 안내)
+    el.summary.innerHTML =
+      `집계 범위: <b>${effStart}~${effEnd}</b> · 차수 W=<b>${W}</b> · 후보 k=<b>${k}</b> · 세트 <b>${FIXED_SET_COUNT}×${FIXED_SET_SIZE}</b> · 미노출 <b>${nonN}</b> · <span style="color:#757575">(선택 회차 ${r} 제외)</span>`;
+
+    // 타입/통계
+    appendLog("분석용 타입(11종) 구성…");
+    const analysisTypes = buildAllAnalysisTypes();
+
+    const previewName  = el.previewType?.value || "range3";
+    const previewTypes = buildPreviewType(previewName);
+
+    appendLog("번호별 기초 통계 계산(k, recency) …");
+    const {k:K, recency} = computeIndividualStats(W, r);
+
+    appendLog("분석용 관측치/유형통계 계산 …");
+    const O_analysis    = computeObserved(W, r, analysisTypes);
+    const info_analysis = computeTypeStats(W, analysisTypes, O_analysis);
+
+    appendLog("미리보기 관측치/유형통계 계산(확인용) …");
+    const O_preview    = computeObserved(W, r, previewTypes);
+    const info_preview = computeTypeStats(W, previewTypes, O_preview);
+
+    appendLog("번호 점수 합성 S(n) 계산 …");
+    const S    = scoreNumbers(W, r, info_analysis, K, recency);
+
+    appendLog("후보군 상위 k 추출 …");
+    const cand = topKFromScores(S, k);
+
+    appendLog("softmax 확률 p(n) 계산 …");
+    const P    = softmaxFromScores(S);
+
+    appendLog("예상 노출 세트(5×6) 생성 …");
+    const sets = buildExposureSets(P, FIXED_SET_COUNT, FIXED_SET_SIZE, dedup);
+
+    appendLog("미노출 후보 N개 산출 …");
+    const low = [];
+    for (let n=1;n<=45;n++) low.push([n, P[n]]);
+    low.sort((a,b)=> (a[1]-b[1]) || (a[0]-b[0]));
+    const nonExpose = [];
+    for (const [n] of low){
+      if (!cand.has(n)) nonExpose.push(n);
+      if (nonExpose.length>=nonN) break;
+    }
+
+    // Type Rate 패널 (실패해도 아래 렌더 계속)
+    try {
+      renderTypePanel(info_preview);
+    } catch (e) {
+      console.error(e);
+      appendLog("Type Rate 패널 렌더 실패 (분석/예상은 계속 진행)", "warn");
+    }
+
+    // === 메인 테이블 렌더: 헤더 → 빈도수 → 적용회차 → 후보군 → 미노출 ===
+    const tableHost = el.table; tableHost.innerHTML = "";
+    let html = "<table>";
+
+    // 0) 번호 헤더
+    html += "<tr>";
+    for (let i=1;i<=45;i++) html += `<th>${i}</th>`;
+    html += "</tr>";
+
+    // 1) 빈도수
+    const minK = Math.min(...K.slice(1));
+    const maxK = Math.max(...K.slice(1));
+    html += `<tr><td colspan="45" class="section-label">빈도수 (최근 W=${W}, 보너스 0.5)</td></tr>`;
+    html += "<tr>";
+    for (let i=1;i<=45;i++){
+      const color = getHeat(minK, maxK, K[i]);
+      const tip   = `번호 ${i}: 최근 ${W}회 빈도 ${K[i]}`;
+      html += `<td style="background:${color};color:#111" title="${tip}">${K[i]}</td>`;
+    }
+    html += "</tr>";
+
+    // 2) 적용회차 추출 (선택 회차 r의 당첨번호/보너스를 그대로 표시)
+    html += `<tr><td colspan="45" class="section-label">적용회차 추출 (선택 회차 ${r})</td></tr>`;
+    html += "<tr>";
+    const applyRow = findApplyRow(r);
+    let applyNums = []; let applyBonus = null;
+    if (applyRow && applyRow.length>=8){ applyNums = applyRow.slice(1,7); applyBonus = applyRow[7]; }
+    for (let i=1;i<=45;i++){
+      let val=0, cls="", tip="적용회차에 선택되지 않음";
+      if (applyNums.includes(i))      { val=1; cls="highlight-pink";  tip=`적용회차 당첨 번호: ${i}`; }
+      else if (applyBonus===i)        { val=1; cls="highlight-green"; tip=`적용회차 보너스 번호: ${i}`; }
+      html += `<td class="${cls}" title="${tip}">${val}</td>`;
+    }
+    html += "</tr>";
+
+    // 3) 예상 후보군
+    html += `<tr><td colspan="45" class="section-label">예상 후보군</td></tr>`;
+    html += "<tr>";
+    for (let i=1;i<=45;i++){
+      const inSet = cand.has(i);
+      html += `<td class="${inSet?"highlight-purple":""}">${inSet?1:0}</td>`;
+    }
+    html += "</tr>";
+
+    // 4) 예상 미노출
+    const nonSet = new Set(nonExpose);
+    html += `<tr><td colspan="45" class="section-label">예상 미노출</td></tr>`;
+    html += "<tr>";
+    for (let i=1;i<=45;i++){
+      const isNX = nonSet.has(i);
+      const tip = `p(${i})=${(P[i]*100).toFixed(2)}%`;
+      html += `<td class="${isNX?"highlight-nonexpose":""}" title="${tip}">${isNX?1:0}</td>`;
+    }
+    html += "</tr>";
+
+    html += "</table>";
+    tableHost.innerHTML = html;
+    applyColumnSeparators(tableHost);
+    enableColumnHoverBand(tableHost);
+
+    // === 세트 렌더 (5×6) ===
+    const setsHost = el.exposureSets; setsHost.innerHTML = "";
+    const title = document.createElement('div'); title.className = "set-line";
+    title.innerHTML = `<b>예상 노출 세트</b> (세트 수=${FIXED_SET_COUNT}, 세트 크기=${FIXED_SET_SIZE}, 중복 방지)`;
+    setsHost.appendChild(title);
+    sets.forEach((arr,i)=>{
+      const line = document.createElement('div'); line.className="set-line";
+      line.innerHTML = `세트 ${i+1}: <span class="nums">${arr.map(n=>`<span class="chip">${n}</span>`).join("")}</span>`;
+      setsHost.appendChild(line);
+    });
+
+    appendLog("완료!", "ok");
   }
 
-  return { set: cand, score };
-}
+  /* ===================== 초기화/이벤트 ===================== */
+  window.addEventListener('DOMContentLoaded', ()=>{
+    el = {
+      // 상단
+      previewType:  document.getElementById('previewType'),
+      applyRound:   document.getElementById('applyRound'),
+      // 중단(조건)
+      totalRounds:    document.getElementById('totalRounds'),
+      candidateCount: document.getElementById('candidateCount'),
+      nonExposeCount: document.getElementById('nonExposeCount'),
+      runBtn:         document.getElementById('runBtn'),
+      clearLogBtn:    document.getElementById('clearLogBtn'),
+      // 하단
+      summary:      document.getElementById('summary'),
+      table:        document.getElementById('table'),
+      exposureSets: document.getElementById('exposureSets'),
+      typePanel:    document.getElementById('typePanel'),
+      progress:     document.getElementById('progress')
+    };
 
-/* ============== 전부 0 회차: 예상 추출 6개 샘플 ============== */
-function weightedSampleWithoutReplacement(probsMap, drawCount = 6) {
-  const pool = Array.from(probsMap.keys());
-  const weights = pool.map(k => probsMap.get(k));
-  const picked = [];
-  let total = weights.reduce((a,b)=>a+b,0);
-  for (let t=0; t<drawCount && pool.length>0; t++) {
-    let r = Math.random() * total, idx = 0;
-    while (idx < pool.length && r > weights[idx]) { r -= weights[idx]; idx++; }
-    if (idx >= pool.length) idx = pool.length - 1;
-    picked.push(pool[idx]);
-    total -= weights[idx];
-    pool.splice(idx,1);
-    weights.splice(idx,1);
-  }
-  return picked.sort((a,b)=>a-b);
-}
+    try{
+      prepareDataOnce();
+      if (!el.applyRound.value) el.applyRound.value = ROUND_MAX; // 최신 회차 기본 선택
+      renderDataViewer(); // ✅ 모든 회차 표시
+    }catch(err){
+      console.error(err);
+      appendLog("초기 데이터 준비 실패", "err");
+    }
 
-function getRoundRow(round) { return CLEANED_DATA.find(r => r[0] === round); }
+    // 실행 버튼
+    el.runBtn?.addEventListener('click', renderAll);
+    // 미리보기 타입 변경 시 패널 포함 갱신
+    el.previewType?.addEventListener('change', debounce(renderAll, 120));
 
-/* =================== 메인 시뮬레이션 =================== */
-function simulate() {
-  prepareDataOnce();
-
-  const totalRoundsEl = document.getElementById("totalRounds");
-  const applyRoundEl  = document.getElementById("applyRound");
-  const candidateEl   = document.getElementById("candidateCount");
-  const modeEl        = document.getElementById("mode");
-  const objEl         = document.getElementById("objective");
-
-  let totalRounds = clampInt(totalRoundsEl?.value, 1, 180, DEFAULT_TOTAL_ROUNDS);
-
-  // [PATCH] 회차 입력을 '예측 가능 범위'로 보정
-  let applyRoundRaw = parseInt(applyRoundEl?.value, 10);
-  let applyRound    = clampRoundOrPredictable(applyRoundRaw);
-
-  let k = clampInt(candidateEl?.value, K_MIN, K_MAX, 10);
-  if (totalRoundsEl) totalRoundsEl.value = totalRounds;
-  if (applyRoundEl)  applyRoundEl.value  = applyRound;
-  if (candidateEl)   candidateEl.value   = k;
-
-  const mode      = modeEl?.value || 'predict';
-  const objective = objEl?.value  || 'avg';
-
-  // === 집계(항상 적용회차 직전 r-1까지) ===
-  const counts = aggregateCountsUntil(applyRound - 1, totalRounds);
-
-  // === [PATCH] 예측 회차 판별 및 적용 데이터 구성 ===
-  // 조건: (1) 입력 회차가 ZERO_ROUNDS에 있음  OR  (2) ROUND_MAX + 1
-  const isZeroRoundProvided = ZERO_ROUNDS.has(applyRound);
-  const isNextRound         = (!isZeroRoundProvided) && (applyRound === (ROUND_MAX + 1));
-  const isPredictRound      = isZeroRoundProvided || isNextRound;
-
-  // 예측 회차면 전부 0 더미 행 구성, 아니면 실제 행 사용
-  let applyData = isPredictRound
-    ? [applyRound, 0,0,0,0,0,0, 0]
-    : getRoundRow(applyRound);
-
-  const isDummy = applyData && applyData.slice(1,8).every(n => n === 0); // 안전한 플래그
-
-  // === 가중치 선택(튜닝 결과 → 힌트 → 기본) ===
-  let weights = { ...DEFAULT_WEIGHTS };
-  if (k === 7) {
-    if (!TUNED.k7)  optimizeWeightsForK(7, 3, totalRounds, 250);
-    if (TUNED.k7?.weights) weights = TUNED.k7.weights;
-    else if (objective === 'hiHit') weights = { ...HINT_WEIGHTS.hiHit7 };
-  } else if (k === 10) {
-    if (!TUNED.k10) optimizeWeightsForK(10, 4, totalRounds, 250);
-    if (TUNED.k10?.weights) weights = TUNED.k10.weights;
-    else if (objective === 'hiHit') weights = { ...HINT_WEIGHTS.hiHit10 };
-  }
-
-  // === 후보군 생성 (정규화/후처리 포함) ===
-  const { set: candidateSet, score } =
-    getScoredCandidatesWithScores(counts, applyData, totalRounds, k, weights, { range:true, ending:true, normalize:true });
-
-  // === 미노출 후보군 ===
-  const probsAll = scoresToProbs(score, 1.0);
-  const sortedByLowP = Array.from(probsAll.entries())
-    .sort((a,b) => (a[1] - b[1]) || (a[0] - b[0]));
-  const nonExpose = [];
-  for (const [n] of sortedByLowP) {
-    if (!candidateSet.has(n)) nonExpose.push(n);
-    if (nonExpose.length >= k) break;
-  }
-
-  // === 렌더링 준비 ===
-  const maxCount = Math.max(...Object.values(counts));
-  const minCount = Math.min(...Object.values(counts));
-  const applyNums  = applyData ? applyData.slice(1, 7) : [];
-  const applyBonus = applyData ? applyData[7] : null;
-
-  // === 테이블 렌더 ===
-  let html = "<table>";
-
-  // 헤더
-  html += "<tr>";
-  for (let i = 1; i <= 45; i++) html += `<th>${i}</th>`;
-  html += "</tr>";
-
-  // 빈도수
-  html += `<tr><td colspan="45" class="section-label">빈도수</td></tr>`;
-  html += "<tr>";
-  for (let i = 1; i <= 45; i++) {
-    const color = getColor(counts[i], minCount, maxCount);
-    const tip = `번호 ${i}의 최근 ${totalRounds}회 빈도: ${counts[i]}회 (보너스 0.5 반영)`;
-    html += `<td style="background:${color};color:#111" title="${tip}">${counts[i]}</td>`;
-  }
-  html += "</tr>";
-
-  // 적용회차 추출
-  html += `<tr><td colspan="45" class="section-label">적용회차 추출</td></tr>`;
-  html += "<tr>";
-  for (let i = 1; i <= 45; i++) {
-    let val = 0, cls = "";
-    if (applyNums.includes(i)) { val = 1; cls = "highlight-pink"; }
-    else if (applyBonus === i) { val = 1; cls = "highlight-green"; }
-    const tip = (val === 1)
-      ? (applyBonus === i ? `적용회차 보너스 번호: ${i}` : `적용회차 당첨 번호: ${i}`)
-      : `적용회차에 선택되지 않음`;
-    html += `<td class="${cls}" title="${tip}">${val}</td>`;
-  }
-  html += "</tr>";
-
-  // 예상 후보군
-  html += `<tr><td colspan="45" class="section-label">예상 후보군</td></tr>`;
-  html += "<tr>";
-  for (let i = 1; i <= 45; i++) {
-    const inSet = candidateSet.has(i);
-    const tip = inSet ? `스코어 상위 후보 포함: ${i}` : `후보 미포함`;
-    html += `<td class="${inSet ? "highlight-purple" : ""}" title="${tip}">${inSet ? 1 : 0}</td>`;
-  }
-  html += "</tr>";
-
-  // 예상 미노출 후보군
-  html += `<tr><td colspan="45" class="section-label">예상 미노출 후보군</td></tr>`;
-  html += "<tr>";
-  const nonExposeSet = new Set(nonExpose);
-  for (let i = 1; i <= 45; i++) {
-    const isNX = nonExposeSet.has(i);
-    const p = probsAll.get(i) || 0;
-    const pText = (p * 100).toFixed(2) + '%';
-    const qText = ((1 - p) * 100).toFixed(2) + '%';
-    const tip = `p(${i})=${pText} | 미노출 확률=${qText}`;
-    html += `<td class="${isNX ? "highlight-nonexpose" : ""}" title="${tip}">${isNX ? 1 : 0}</td>`;
-  }
-  html += "</tr>";
-
-  html += "</table>";
-  document.getElementById("table").innerHTML = html;
-
-  // 요약
-  const isPredictBadge = isPredictRound ? ' (예측 회차)' : '';
-  let summaryHtml =
-    `적용회차: <b>${applyRound}${isPredictBadge}</b> / 차수 크기: <b>${totalRounds}</b> / 후보 개수: <b>${k}</b><br>
-     집계 범위: ${applyRound - totalRounds} ~ ${applyRound - 1} 회차`;
-
-  // 전부 0(더미) → softmax 기반 6개 샘플
-  if (isDummy) {
-    const probsCand = new Map();
-    for (const n of candidateSet) probsCand.set(n, probsAll.get(n) || 0);
-    const pick6 = weightedSampleWithoutReplacement(
-      probsCand.size ? probsCand : probsAll, 6
-    );
-    summaryHtml += `<br><b>예상 추출(샘플):</b> ${pick6.join(", ")}`;
-  }
-
-  summaryHtml += `<br><span style="opacity:.75">w1:${weights.w1}, w2:${weights.w2}, w3:${weights.w3}, w4:${weights.w4}</span>`;
-  document.getElementById("summary").innerHTML = summaryHtml;
-}
-
-/* =================== 초기화 & 이벤트 =================== */
-window.addEventListener('DOMContentLoaded', () => {
-  prepareDataOnce();
-  const tr  = document.getElementById('totalRounds');
-  const ar  = document.getElementById('applyRound');
-  const cc  = document.getElementById('candidateCount');
-  const btn = document.getElementById('refreshBtn');
-  const tuneBtn = document.getElementById('tuneBtn');
-
-  if (tr && (!tr.value || parseInt(tr.value, 10) <= 0)) tr.value = DEFAULT_TOTAL_ROUNDS;
-
-  // 기본 적용회차: 비어있으면 최신(ROUND_MAX)
-  if (ar && (!ar.value || parseInt(ar.value, 10) === 0)) ar.value = ROUND_MAX;
-
-  if (cc && (!cc.value || parseInt(cc.value, 10) <= 0)) cc.value = 10;
-
-  const onInput = debounce(() => simulate(), 120);
-  tr?.addEventListener('input', onInput);
-  ar?.addEventListener('input', onInput);
-  cc?.addEventListener('input', onInput);
-  btn?.addEventListener('click', () => simulate());
-
-  tuneBtn?.addEventListener('click', () => {
-    const trv = clampInt(tr?.value, 1, 180, DEFAULT_TOTAL_ROUNDS);
-    console.time('tune7');  optimizeWeightsForK(7, 3, trv, 250);  console.timeEnd('tune7');
-    console.time('tune10'); optimizeWeightsForK(10, 4, trv, 250); console.timeEnd('tune10');
-    simulate();
+    // 최초 1회 실행
+    renderAll();
   });
+})();
 
-  simulate();
-});
+/* =====================================================
+ * Real Data (#dataViewer) 높이 확대/축소 핸들 + 상태 저장
+ * (HTML 무수정, styles.css의 .rd-resize-handle 와 연동)
+ * ===================================================== */
+(function initRealDataHeightControl() {
+  window.addEventListener('DOMContentLoaded', () => {
+    const wrap  = document.getElementById('dataViewer');
+    const inner = document.getElementById('dataViewerInner');
+    if (!wrap || !inner) return;
 
-/* =================== (선택) 콘솔 유틸 =================== */
-function backtestOnce(round, totalRounds, k, weights) {
-  const counts = aggregateCountsUntil(round - 1, totalRounds);
-  const applyData = getRoundRow(round);
-  const { set: cand } = getScoredCandidatesWithScores(counts, applyData, totalRounds, k, weights);
-  const actual = new Set(applyData.slice(1, 7));
-  let hits = 0; for (const n of cand) if (actual.has(n)) hits++;
-  return hits;
-}
-function lexGreater(a, b) {
-  for (let i=0;i<Math.max(a.length,b.length);i++) {
-    if ((a[i]||0) > (b[i]||0)) return true;
-    if ((a[i]||0) < (b[i]||0)) return false;
-  }
-  return false;
-}
-function optimizeWeightsForK(k, targetHits, totalRounds = DEFAULT_TOTAL_ROUNDS, sampleN = 250) {
-  prepareDataOnce();
-  const roundsAsc = CLEANED_DATA.map(r => r[0]).sort((a,b)=>a-b)
-    .filter(r => (r - 1) >= ROUND_MIN && (r - totalRounds) >= ROUND_MIN);
-  const sample = roundsAsc.slice(-sampleN);
-  const GRID = (k === 7)
-    ? { w1:[0.6,0.8,1.0], w2:[0.0,0.3], w3:[0.8,1.2,1.6], w4:[0.0,0.2,0.4] }
-    : { w1:[0.8,1.0,1.2], w2:[0.3,0.6], w3:[0.5,0.8,1.2], w4:[0.0,0.2,0.4] };
-  let best = null, bestW = null, bestStats = null;
-  for (const w1 of GRID.w1) for (const w2 of GRID.w2)
-  for (const w3 of GRID.w3) for (const w4 of GRID.w4) {
-    let cnt = 0, sumH = 0, geT = 0, geTminus1 = 0;
-    for (const r of sample) {
-      const h = backtestOnce(r, totalRounds, k, { w1, w2, w3, w4 });
-      sumH += h; cnt++;
-      if (h >= targetHits) geT++;
-      if (h >= targetHits - 1) geTminus1++;
+    // 핸들 1회만 생성
+    if (!wrap.querySelector('.rd-resize-handle')) {
+      const handle = document.createElement('div');
+      handle.className = 'rd-resize-handle';
+      wrap.appendChild(handle);
     }
-    const avg = sumH / cnt;
-    const pGeT  = geT / cnt;
-    const pGeT1 = geTminus1 / cnt;
-    const key = (k === 7) ? [pGeT, pGeT1, avg] : [pGeT, avg, pGeT1];
-    if (!best || (function lexGreater(a, b){for(let i=0;i<Math.max(a.length,b.length);i++){if((a[i]||0)>(b[i]||0))return true;if((a[i]||0)<(b[i]||0))return false;}return false;})(key,best)) {
-      best = key; bestW = { w1, w2, w3, w4 }; bestStats = { avg, pGeT, pGeT1, tested: cnt };
+    const handle = wrap.querySelector('.rd-resize-handle');
+
+    // 저장 높이 복원 (px 단위, max-height 적용)
+    const KEY = 'ui:realdata:maxh';
+    const saved = parseInt(localStorage.getItem(KEY), 10);
+    if (Number.isFinite(saved) && saved >= 120) {
+      inner.style.maxHeight = saved + 'px';
     }
-  }
-  const slot = (k === 7) ? 'k7' : 'k10';
-  TUNED[slot] = { weights: bestW, stats: bestStats };
-  return TUNED[slot];
-}
+
+    // 드래그 리사이즈
+    let dragging = false, sy = 0, sh = 0;
+    const MIN_H = 140; // 헤더 + 최소 3~4행 감안
+
+    handle.addEventListener('mousedown', (e) => {
+      dragging = true;
+      sy = e.clientY;
+      const cs = getComputedStyle(inner);
+      sh = parseFloat(cs.maxHeight);
+      if (!Number.isFinite(sh)) sh = inner.offsetHeight;
+      document.body.style.cursor = 'row-resize';
+      e.preventDefault();
+    });
+
+    const onMove = (e) => {
+      if (!dragging) return;
+      const nh = Math.max(MIN_H, sh + (e.clientY - sy));
+      inner.style.maxHeight = nh + 'px';
+    };
+
+    const onUp = () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.style.cursor = '';
+      const nh = parseFloat(getComputedStyle(inner).maxHeight);
+      if (Number.isFinite(nh)) {
+        localStorage.setItem(KEY, String(Math.round(nh)));
+      }
+    };
+
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  });
+})();
