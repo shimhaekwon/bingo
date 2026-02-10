@@ -252,3 +252,30 @@ td.col-hover, th.col-hover {
   z-index: 5;
 }
 .rd-resize-handle:hover { background: rgba(0,0,0,.08); }
+
+/* ==========================================
+ * Lotto 6/45 공식 색상 매핑 (01~45)
+ * 01-10: 노랑, 11-20: 파랑, 21-30: 빨강, 31-40: 회색, 41-45: 초록
+ * ========================================== */
+
+/* 숫자 칩(세트/요약/표 내부 공통으로 재사용) */
+.lotto-chip {
+  display:inline-block; padding:2px 8px; border-radius:999px;
+  font-weight:800; font-variant-numeric:tabular-nums;
+  border:1px solid var(--border); box-shadow: var(--shadow);
+  min-width: 28px; text-align:center;
+}
+
+/* 배경색 정의 (가독성 보정 포함) */
+.lotto-yellow { background:#FFE082; color:#3e2723; } /* 01-10 */
+.lotto-blue   { background:#90CAF9; color:#0d47a1; } /* 11-20 */
+.lotto-red    { background:#FF8A80; color:#b71c1c; } /* 21-30 */
+.lotto-gray   { background:#ECEFF1; color:#263238; } /* 31-40 */
+.lotto-green  { background:#A5D6A7; color:#1b5e20; } /* 41-45 */
+
+/* 표 셀에 적용할 때는 칩 없이 셀 배경만 칠할 수도 있음 */
+.cell-yellow { background:#FFF3B0; }
+.cell-blue   { background:#BBDEFB; }
+.cell-red    { background:#FFCDD2; }
+.cell-gray   { background:#ECEFF1; }
+.cell-green  { background:#C8E6C9; }

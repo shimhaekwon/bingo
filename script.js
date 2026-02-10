@@ -4,8 +4,9 @@
  * - 분석/예상 계산: 11개 타입(고정) 동시 사용
  * - 미리보기 타입(드롭다운)은 확인용 패널에만 사용
  * - 적용회차: 상단 좌측 '실제 데이터' 표의 라디오/셀 클릭으로 지정
- * - 후보 k, 미노출 N: 6~20
+ * - 후보 k: 6~15
  * - 세트 수=5(고정), 세트 크기=6(고정)
+ * - 패턴 필터 + Top-K 포함 제약 적용
  * =========================================================== */
 (function(){
   // ===== 고정값 =====
@@ -15,7 +16,7 @@
   // ===== 전역 상태 =====
   // [[round, n1..n6, bonus], ...] (중복 최신 유지)
   // *주의*: 0만 들어있는 회차(아직 미추첨 등)도 그대로 유지/노출
-  let CLEANED   = null;
+  let CLEANED = null;
   let ROUND_MIN = null;
   let ROUND_MAX = null;
 
@@ -24,10 +25,10 @@
 
   // 하이퍼파라미터
   const HP = {
-    beta1: 0.6,   // 기본 결손 가중
-    beta2: 0.3,   // 기본 최근성 가중
-    lambda: 0.3,  // 그룹 내부 분배 시 최근성 가중
-    tau: 1.0      // softmax 온도
+    beta1: 0.6, // 기본 결손 가중
+    beta2: 0.3, // 기본 최신성 가중
+    lambda: 0.3, // 그룹 내부 분배 시 최신성 가중
+    tau: 1.0 // softmax 온도
   };
 
   /* ===================== 유틸/공통 ===================== */
@@ -43,7 +44,7 @@
   function clearLog(){ if (el.progress) el.progress.innerHTML = ""; }
   function debounce(fn, delay = 120) {
     let t = null;
-    return (...args) => { clearTimeout(t); t = setTimeout(() => fn.apply(null, args), delay); };
+    return (...args) => { clearTimeout(t); t = setTimeout(()=>fn.apply(null, args), delay); };
   }
   function clampInt(v, min, max, fb=min){
     const n = parseInt(v, 10);
@@ -58,19 +59,30 @@
     return n;
   }
 
+  // ===================== Lotto 색상 매핑 유틸 =====================
+  function lottoColorClass(n, mode="cell") {
+    // mode="cell" → 배경만 칠함(표 셀), mode="chip" → 칩 배경
+    const clsBase = (mode === "chip") ? "lotto-" : "cell-";
+    if (n >= 1 && n <= 10) return clsBase + "yellow";
+    if (n >= 11 && n <= 20) return clsBase + "blue";
+    if (n >= 21 && n <= 30) return clsBase + "red";
+    if (n >= 31 && n <= 40) return clsBase + "gray";
+    if (n >= 41 && n <= 45) return clsBase + "green";
+    return ""; // 0, null 등
+  }
+
   /* ===================== 데이터 준비 ===================== */
   function prepareDataOnce(){
-    console.log("[prepareDataOnce] start");
-    if (CLEANED) { console.log("[prepareDataOnce] already prepared"); return; }
-    if (!window.numChosen || !Array.isArray(window.numChosen) || window.numChosen.length===0){
+    if (CLEANED) return;
+    if (!window.numChosen
+      || !Array.isArray(window.numChosen)
+      || window.numChosen.length===0){
       appendLog("data.js의 numChosen을 찾을 수 없습니다.", "err");
       throw new Error("numChosen missing");
     }
-
     // 중복 회차는 "마지막으로 등장한 항목"을 유지하도록 Map으로 집계
     const byRound = new Map();
     let rmin = Infinity, rmax = -Infinity;
-
     for (const row of window.numChosen){
       const round = row[0];
       // *** 0만 있는 회차도 그대로 보관/노출합니다. 필터링 없음. ***
@@ -78,15 +90,11 @@
       if (round < rmin) rmin = round;
       if (round > rmax) rmax = round;
     }
-
     // 회차 내림차순(최신→과거) 정렬: Real Data 테이블 상단이 최신
     const out = Array.from(byRound.values()).sort((a,b)=>b[0]-a[0]);
-
-    CLEANED   = out;
+    CLEANED = out;
     ROUND_MIN = rmin;
     ROUND_MAX = rmax;
-
-    console.log("[prepareDataOnce] done: rows=", CLEANED.length, "min=", ROUND_MIN, "max=", ROUND_MAX);
   }
 
   /* ===================== 타입 생성 ===================== */
@@ -111,35 +119,36 @@
     return groups;
   }
   function makeSingle45(){ return Array.from({length:45},(_,i)=>[i+1]); }
+
   function buildAllAnalysisTypes(){
     return [
       { name:"single45", groups: makeSingle45() },
-      { name:"range3",   groups: makeRangeGroups(3) },
-      { name:"range5",   groups: makeRangeGroups(5) },
-      { name:"range6",   groups: makeRangeGroups(6) },
-      { name:"range9",   groups: makeRangeGroups(9) },
-      { name:"range10",  groups: makeRangeGroups(10) },
-      { name:"range15",  groups: makeRangeGroups(15) },
-      { name:"mod3",     groups: makeModGroups(3) },
-      { name:"mod9",     groups: makeModGroups(9) },
-      { name:"mod15",    groups: makeModGroups(15) },
+      { name:"range3",  groups: makeRangeGroups(3)  },
+      { name:"range5",  groups: makeRangeGroups(5)  },
+      { name:"range6",  groups: makeRangeGroups(6)  },
+      { name:"range9",  groups: makeRangeGroups(9)  },
+      { name:"range10", groups: makeRangeGroups(10) },
+      { name:"range15", groups: makeRangeGroups(15) },
+      { name:"mod3",    groups: makeModGroups(3)    },
+      { name:"mod9",    groups: makeModGroups(9)    },
+      { name:"mod15",   groups: makeModGroups(15)   },
       { name:"endDigit10", groups: makeEndDigit10() }
     ];
   }
   function buildPreviewType(name){
     switch(name){
-      case "single45":  return [{ name, groups: makeSingle45() }];
-      case "range3":    return [{ name, groups: makeRangeGroups(3) }];
-      case "range5":    return [{ name, groups: makeRangeGroups(5) }];
-      case "range6":    return [{ name, groups: makeRangeGroups(6) }];
-      case "range9":    return [{ name, groups: makeRangeGroups(9) }];
-      case "range10":   return [{ name, groups: makeRangeGroups(10) }];
-      case "range15":   return [{ name, groups: makeRangeGroups(15) }];
-      case "mod3":      return [{ name, groups: makeModGroups(3) }];
-      case "mod9":      return [{ name, groups: makeModGroups(9) }];
-      case "mod15":     return [{ name, groups: makeModGroups(15) }];
-      case "endDigit10":return [{ name, groups: makeEndDigit10() }];
-      default:          return [{ name:"range3", groups: makeRangeGroups(3) }];
+      case "single45": return [{ name, groups: makeSingle45() }];
+      case "range3":   return [{ name, groups: makeRangeGroups(3)  }];
+      case "range5":   return [{ name, groups: makeRangeGroups(5)  }];
+      case "range6":   return [{ name, groups: makeRangeGroups(6)  }];
+      case "range9":   return [{ name, groups: makeRangeGroups(9)  }];
+      case "range10":  return [{ name, groups: makeRangeGroups(10) }];
+      case "range15":  return [{ name, groups: makeRangeGroups(15) }];
+      case "mod3":     return [{ name, groups: makeModGroups(3)    }];
+      case "mod9":     return [{ name, groups: makeModGroups(9)    }];
+      case "mod15":    return [{ name, groups: makeModGroups(15)   }];
+      case "endDigit10":return[{ name, groups: makeEndDigit10()    }];
+      default:         return [{ name:"range3", groups: makeRangeGroups(3) }];
     }
   }
 
@@ -149,10 +158,8 @@
     // 효과 범위: [start, end] = [(rEnd-1)-W+1, (rEnd-1)]
     const effectiveEnd = rEnd - 1;
     const start = effectiveEnd - W + 1;
-
     const k = Array(46).fill(0);
     const lastSeen = Array(46).fill(null);
-
     for (const row of CLEANED){
       const [round,n1,n2,n3,n4,n5,n6,bonus] = row;
       if (round < start || round > effectiveEnd) continue;
@@ -168,7 +175,6 @@
         if (lastSeen[bonus]===null || lastSeen[bonus] < round) lastSeen[bonus] = round;
       }
     }
-
     const recency = Array(46).fill(0);
     for (let n=1;n<=45;n++){
       recency[n] = (lastSeen[n]===null) ? W : (effectiveEnd - lastSeen[n]);
@@ -180,7 +186,6 @@
   function computeObserved(W, rEnd, types){
     const effectiveEnd = rEnd - 1;
     const start = effectiveEnd - W + 1;
-
     const O = {};
     const mapIndex = {};
     for (const t of types){
@@ -208,9 +213,9 @@
   function computeTypeStats(W, types, O){
     const info = [];
     for (const t of types){
-      const E  = t.groups.map(g => W * 6 * (g.length/45));
+      const E = t.groups.map(g => W * 6 * (g.length/45));
       const SR = O[t.name].map((o,i) => (o - E[i]) / Math.sqrt(E[i] + 1e-9));
-      const s  = SR.map(x => -x);
+      const s = SR.map(x => -x);
       let chi2 = 0;
       for (let i=0;i<E.length;i++){
         chi2 += Math.pow(O[t.name][i]-E[i],2) / (E[i]+1e-9);
@@ -221,12 +226,11 @@
     info.forEach(x => x.alpha = x.chi2 / sumChi);
     return info;
   }
-
   function zNormalize(arr){
-    const n    = arr.length || 1;
+    const n = arr.length || 1;
     const mean = arr.reduce((a,b)=>a+b,0)/n;
     const varc = arr.reduce((a,b)=>a+(b-mean)*(b-mean),0)/n;
-    const std  = Math.sqrt(varc) || 1;
+    const std = Math.sqrt(varc) || 1;
     return arr.map(v => (v-mean)/std);
   }
 
@@ -237,7 +241,6 @@
     const deficitZ = zNormalize(deficit.slice(1)); deficitZ.unshift(0);
     const recZ     = zNormalize(recency.slice(1)); recZ.unshift(0);
     const S = Array(46).fill(0);
-
     for (const ti of typeInfo){
       const alpha = ti.alpha;
       for (let gi=0; gi<ti.groups.length; gi++){
@@ -260,12 +263,12 @@
 
   /* ===================== 확률/후보/세트 ===================== */
   function softmaxFromScores(S){
-    const arr  = [];
+    const arr = [];
     for (let n=1;n<=45;n++) arr.push(S[n]);
     const maxV = Math.max(...arr);
     const exps = arr.map(v => Math.exp((v - maxV)/HP.tau));
-    const Z    = exps.reduce((a,b)=>a+b,0) || 1;
-    const P    = Array(46).fill(0);
+    const Z = exps.reduce((a,b)=>a+b,0) || 1;
+    const P = Array(46).fill(0);
     for (let n=1;n<=45;n++) P[n] = exps[n-1]/Z;
     return P;
   }
@@ -295,26 +298,12 @@
     picked.sort((a,b)=>a-b);
     return picked;
   }
-  function buildExposureSets(P, setsCount, setSize, dedup){
-    const sets = [];
-    const used = new Set();
-    for (let s=0;s<setsCount;s++){
-      const local = Array(46).fill(0);
-      for (let n=1;n<=45;n++){
-        local[n] = (dedup && used.has(n)) ? 1e-12 : (P[n]||0);
-      }
-      const one = sampleNoReplace(local, setSize);
-      sets.push(one);
-      if (dedup) one.forEach(n => used.add(n));
-    }
-    return sets;
-  }
 
-  /* ===================== 렌더 보조 ===================== */
+  /* ===================== 보조 렌더 ===================== */
   function getHeat(min, max, v){
     if (max===min) return 'rgb(230,230,255)';
     const t = (v - min) / (max - min);
-    const red  = Math.round(255*t);
+    const red = Math.round(255*t);
     const blue = Math.round(255*(1-t));
     return `rgb(${red},220,${blue})`;
   }
@@ -327,7 +316,7 @@
       for (let c=0;c<cells.length;c++){
         const colIndex = c+1;
         if (sepIdx.has(colIndex)) cells[c].classList.add('col-sep');
-        if (colIndex===45)        cells[c].classList.add('last-col');
+        if (colIndex===45) cells[c].classList.add('last-col');
       }
     }
   }
@@ -368,10 +357,8 @@
     const host = document.getElementById('dataViewerInner');
     if (!host || !CLEANED) return;
     host.innerHTML = "";
-
-    // ✅ 모든 회차 표시 (자르지 않음). 최신→과거 정렬은 CLEANED에서 보장.
+    // 모든 회차 표시 (자르지 않음). 최신→과거 정렬은 CLEANED에서 보장.
     const rows = CLEANED;
-
     let html = "<table><thead><tr><th class='col-radio'>선택</th><th>회차</th><th colspan='6'>당첨번호</th><th>보너스</th></tr></thead><tbody>";
     const cur = parseInt(el.applyRound.value || ROUND_MAX, 10);
     for (const [round,n1,n2,n3,n4,n5,n6,bonus] of rows){
@@ -380,7 +367,12 @@
       html += `<tr data-round="${round}">
         <td><input type="radio" name="roundPick" value="${round}" ${checked}/></td>
         <td>${round}</td>
-        <td>${view(n1)}</td><td>${view(n2)}</td><td>${view(n3)}</td><td>${view(n4)}</td><td>${view(n5)}</td><td>${view(n6)}</td>
+        <td class="${lottoColorClass(n1)}">${view(n1)}</td>
+        <td class="${lottoColorClass(n2)}">${view(n2)}</td>
+        <td class="${lottoColorClass(n3)}">${view(n3)}</td>
+        <td class="${lottoColorClass(n4)}">${view(n4)}</td>
+        <td class="${lottoColorClass(n5)}">${view(n5)}</td>
+        <td class="${lottoColorClass(n6)}">${view(n6)}</td>
         <td>${view(bonus)}</td>
       </tr>`;
     }
@@ -399,36 +391,29 @@
         renderAll();
       });
     });
-
     // 라디오 외 '셀' 클릭 → 해당 회차 선택
     host.addEventListener('click', (e) => {
-      if (e.target.matches('input[type="radio"][name="roundPick"]')) return; // 라디오는 기존 핸들러
-      const cell = e.target.closest('td');
-      const tr   = e.target.closest('tr[data-round]');
-      if (!cell || !tr) return;
-      const r = parseInt(tr.dataset.round, 10);
-      if (!Number.isFinite(r)) return;
-      host.querySelector(`input[type="radio"][name="roundPick"][value="${r}"]`)?.click();
+      if (e.target.matches('input[type="radio"][name="roundPick"]')) return;
+      const tr = e.target.closest('tr[data-round]');
+      if (!tr) return;
+      host.querySelector(`input[type="radio"][name="roundPick"][value="${tr.dataset.round}"]`)?.click();
     });
   }
 
   /* ===================== Type Rate 패널 (툴팁/요약표시) ===================== */
   function renderTypePanel(typeInfo){
     const host = el.typePanel; if (!host) return;
-    host.innerHTML = ""; // 중복 렌더 방지
-
+    host.innerHTML = "";
     for (const t of typeInfo){
       // 카드
       const card = document.createElement('div');
       card.className = "type-card";
-
       // 제목
       const h3 = document.createElement('h3');
       h3.textContent = `Type: ${t.name} · χ²=${t.chi2.toFixed(2)} · α=${t.alpha.toFixed(3)}`;
       card.appendChild(h3);
-
       // 표
-      const tbl  = document.createElement('table');
+      const tbl = document.createElement('table');
       const thead = document.createElement('thead');
       thead.innerHTML = `
         <tr>
@@ -439,13 +424,11 @@
           <th title="s = -SR (가중 방향)">s=-SR</th>
         </tr>`;
       tbl.appendChild(thead);
-
       const tbody = document.createElement('tbody');
       for (let gi=0; gi<t.groups.length; gi++){
-        const nums = t.groups[gi];                 // 이 그룹에 포함된 번호 목록
-        const fullList  = nums.join(', ');
+        const nums = t.groups[gi]; // 포함 숫자 목록
+        const fullList = nums.join(', ');
         const shortList = nums.length > 12 ? nums.slice(0,12).join(', ') + ' …' : fullList;
-
         const tr = document.createElement('tr');
         tr.innerHTML = `
           <td title="포함 번호: ${fullList}">
@@ -465,6 +448,93 @@
     }
   }
 
+  /* ===================== Top-K/패턴 필터 ===================== */
+  function topKSetFromScores(S, K) {
+    const arr = [];
+    for (let n=1;n<=45;n++) arr.push([n, S[n]]);
+    arr.sort((a,b)=> (b[1]-a[1]) || (a[0]-b[0]));
+    return new Set(arr.slice(0, K).map(x=>x[0]));
+  }
+  function maxConsecutiveLen(nums) {
+    const a = nums.slice().sort((x,y)=>x-y);
+    let run=1, best=1;
+    for (let i=1;i<a.length;i++){
+      if (a[i] === a[i-1]+1) { run++; if (run>best) best=run; }
+      else run=1;
+    }
+    return best;
+  }
+  function endsCount(nums) {
+    const c = Array(10).fill(0);
+    for (const n of nums) c[n%10]++;
+    return Math.max(...c);
+  }
+  function passesPatternFilters(arr, filters, ctx) {
+    const sum = arr.reduce((p,c)=>p+c,0);
+    if (sum < filters.sumMin || sum > filters.sumMax) return false;
+
+    const run = maxConsecutiveLen(arr);
+    if (run > filters.maxRun) return false;
+
+    const sameEnd = endsCount(arr);
+    if (sameEnd > filters.maxSameEnd) return false;
+
+    const odd = arr.filter(n=>n%2===1).length;
+    if (odd < filters.oddMin || odd > filters.oddMax) return false;
+
+    if (ctx.prev && Number.isFinite(filters.rollMin) && Number.isFinite(filters.rollMax)) {
+      const prev = new Set(ctx.prev);
+      const roll = arr.filter(n=>prev.has(n)).length;
+      if (roll < filters.rollMin || roll > filters.rollMax) return false;
+    }
+
+    if (filters.topKMode === 'k7p3') {
+      const cnt = arr.filter(n=>ctx.top7.has(n)).length;
+      if (cnt < 3) return false;
+    } else if (filters.topKMode === 'k10p4') {
+      const cnt = arr.filter(n=>ctx.top10.has(n)).length;
+      if (cnt < 4) return false;
+    }
+    return true;
+  }
+
+  function buildExposureSets(P, setsCount, setSize, dedup, filters, ctx){
+    const sets = [];
+    const used = new Set();
+    for (let s=0; s<setsCount; s++){
+      let one = null;
+      let attempts = 0;
+      while (attempts < 500) {
+        attempts++;
+        const local = Array(46).fill(0);
+        for (let n=1;n<=45;n++){
+          local[n] = (dedup && used.has(n)) ? 1e-12 : (P[n]||0);
+        }
+        const cand = sampleNoReplace(local, setSize);
+
+        if (passesPatternFilters(cand, filters, ctx)) {
+          one = cand; break;
+        }
+        // 점진적 완화 (난이도 높을 때)
+        if (attempts === 250) { // Top-K 완화
+          if (filters.topKMode !== 'none') filters.topKMode = 'none';
+        } else if (attempts === 350) { // 이월 완화
+          filters.rollMin = 0; filters.rollMax = 6;
+        } else if (attempts === 450) { // 연속 완화
+          filters.maxRun = Math.min(6, filters.maxRun+1);
+        }
+      }
+      if (!one){
+        const local = Array(46).fill(0);
+        for (let n=1;n<=45;n++) local[n] = (dedup && used.has(n)) ? 1e-12 : (P[n]||0);
+        one = sampleNoReplace(local, setSize);
+      }
+      sets.push(one);
+      if (dedup) one.forEach(n=>used.add(n));
+    }
+    return sets;
+  }
+
   /* ===================== 메인 렌더 ===================== */
   function renderAll(){
     clearLog();
@@ -472,15 +542,15 @@
     prepareDataOnce();
 
     // 입력값/가드
-    const W   = clampInt(el.totalRounds.value, 1, 180, 30);
+    const W = clampInt(el.totalRounds.value, 1, 180, 30);
     const rIn = parseInt(el.applyRound.value || ROUND_MAX, 10);
-    const r   = Number.isFinite(rIn) ? clampRound(rIn) : ROUND_MAX;
+    const r = Number.isFinite(rIn) ? clampRound(rIn) : ROUND_MAX;
     el.applyRound.value = r;
-    const k    = clampInt(el.candidateCount.value, 6, 20, 12);
+    const k = clampInt(el.candidateCount.value, 6, 15, 12);
     const nonN = clampInt(el.nonExposeCount.value, 6, 20, 10);
     const dedup = true;
 
-    // 분석 범위는 [ (r-1)-W+1  ~  (r-1) ] 이므로, 시작이 데이터 최솟값보다 작으면 경고
+    // 분석 범위는 [(r-1)-W+1 ~ (r-1)] 이므로, 시작이 데이터 최소보다 작으면 경고
     const effEnd = r - 1;
     const effStart = effEnd - W + 1;
     if (effStart < ROUND_MIN){
@@ -488,39 +558,56 @@
       return;
     }
 
-    // 요약 (선택 회차 제외 안내)
+    // 요약
     el.summary.innerHTML =
-      `집계 범위: <b>${effStart}~${effEnd}</b> · 차수 W=<b>${W}</b> · 후보 k=<b>${k}</b> · 세트 <b>${FIXED_SET_COUNT}×${FIXED_SET_SIZE}</b> · 미노출 <b>${nonN}</b> · <span style="color:#757575">(선택 회차 ${r} 제외)</span>`;
+      `집계 범위: <b>${effStart}~${effEnd}</b> · 차수 W=<b>${W}</b> · 후보 k=<b>${k}</b> · 세트 <b>${FIXED_SET_COUNT}×${FIXED_SET_SIZE}</b> · 미노출 <b>${nonN}</b>
+       · <span style="color:#757575">(선택 회차 ${r} 제외)</span>`;
 
     // 타입/통계
     appendLog("분석용 타입(11종) 구성…");
     const analysisTypes = buildAllAnalysisTypes();
-
-    const previewName  = el.previewType?.value || "range3";
+    const previewName = el.previewType?.value || "range3";
     const previewTypes = buildPreviewType(previewName);
 
     appendLog("번호별 기초 통계 계산(k, recency) …");
     const {k:K, recency} = computeIndividualStats(W, r);
 
     appendLog("분석용 관측치/유형통계 계산 …");
-    const O_analysis    = computeObserved(W, r, analysisTypes);
+    const O_analysis  = computeObserved(W, r, analysisTypes);
     const info_analysis = computeTypeStats(W, analysisTypes, O_analysis);
 
     appendLog("미리보기 관측치/유형통계 계산(확인용) …");
-    const O_preview    = computeObserved(W, r, previewTypes);
-    const info_preview = computeTypeStats(W, previewTypes, O_preview);
+    const O_preview   = computeObserved(W, r, previewTypes);
+    const info_preview  = computeTypeStats(W, previewTypes, O_preview);
 
     appendLog("번호 점수 합성 S(n) 계산 …");
-    const S    = scoreNumbers(W, r, info_analysis, K, recency);
+    const S = scoreNumbers(W, r, info_analysis, K, recency);
 
     appendLog("후보군 상위 k 추출 …");
     const cand = topKFromScores(S, k);
 
     appendLog("softmax 확률 p(n) 계산 …");
-    const P    = softmaxFromScores(S);
+    const P = softmaxFromScores(S);
 
     appendLog("예상 노출 세트(5×6) 생성 …");
-    const sets = buildExposureSets(P, FIXED_SET_COUNT, FIXED_SET_SIZE, dedup);
+    // Top-K/이월 제약 준비
+    const top7  = topKSetFromScores(S, 7);
+    const top10 = topKSetFromScores(S, 10);
+    const prevRow = findApplyRow(r-1);
+    const prevNums = (prevRow && prevRow.length>=7) ? prevRow.slice(1,7) : null;
+    const filters = {
+      sumMin: clampInt(el.sumMin.value, 60, 270, 100),
+      sumMax: clampInt(el.sumMax.value, 60, 270, 180),
+      maxRun: clampInt(el.maxRun.value, 1, 6, 3),
+      maxSameEnd: clampInt(el.maxSameEnd.value, 1, 6, 3),
+      oddMin: clampInt(el.oddMin.value, 0, 6, 2),
+      oddMax: clampInt(el.oddMax.value, 0, 6, 4),
+      rollMin: clampInt(el.rollMin.value, 0, 6, 0),
+      rollMax: clampInt(el.rollMax.value, 0, 6, 2),
+      topKMode: (el.topKConstraint?.value) || 'k7p3'
+    };
+    const ctx = { top7, top10, prev: prevNums };
+    const sets = buildExposureSets(P, FIXED_SET_COUNT, FIXED_SET_SIZE, dedup, {...filters}, ctx);
 
     appendLog("미노출 후보 N개 산출 …");
     const low = [];
@@ -543,7 +630,6 @@
     // === 메인 테이블 렌더: 헤더 → 빈도수 → 적용회차 → 후보군 → 미노출 ===
     const tableHost = el.table; tableHost.innerHTML = "";
     let html = "<table>";
-
     // 0) 번호 헤더
     html += "<tr>";
     for (let i=1;i<=45;i++) html += `<th>${i}</th>`;
@@ -556,12 +642,12 @@
     html += "<tr>";
     for (let i=1;i<=45;i++){
       const color = getHeat(minK, maxK, K[i]);
-      const tip   = `번호 ${i}: 최근 ${W}회 빈도 ${K[i]}`;
+      const tip = `번호 ${i}: 최근 ${W}회 빈도 ${K[i]}`;
       html += `<td style="background:${color};color:#111" title="${tip}">${K[i]}</td>`;
     }
     html += "</tr>";
 
-    // 2) 적용회차 추출 (선택 회차 r의 당첨번호/보너스를 그대로 표시)
+    // 2) 적용회차 추출 (선택 회차 r의 당첨/보너스 그대로 표시)
     html += `<tr><td colspan="45" class="section-label">적용회차 추출 (선택 회차 ${r})</td></tr>`;
     html += "<tr>";
     const applyRow = findApplyRow(r);
@@ -569,8 +655,8 @@
     if (applyRow && applyRow.length>=8){ applyNums = applyRow.slice(1,7); applyBonus = applyRow[7]; }
     for (let i=1;i<=45;i++){
       let val=0, cls="", tip="적용회차에 선택되지 않음";
-      if (applyNums.includes(i))      { val=1; cls="highlight-pink";  tip=`적용회차 당첨 번호: ${i}`; }
-      else if (applyBonus===i)        { val=1; cls="highlight-green"; tip=`적용회차 보너스 번호: ${i}`; }
+      if (applyNums.includes(i)) { val=1; cls="highlight-pink";  tip=`적용회차 당첨 번호: ${i}`; }
+      else if (applyBonus===i)   { val=1; cls="highlight-green"; tip=`적용회차 보너스 번호: ${i}`; }
       html += `<td class="${cls}" title="${tip}">${val}</td>`;
     }
     html += "</tr>";
@@ -594,7 +680,6 @@
       html += `<td class="${isNX?"highlight-nonexpose":""}" title="${tip}">${isNX?1:0}</td>`;
     }
     html += "</tr>";
-
     html += "</table>";
     tableHost.innerHTML = html;
     applyColumnSeparators(tableHost);
@@ -618,35 +703,76 @@
   window.addEventListener('DOMContentLoaded', ()=>{
     el = {
       // 상단
-      previewType:  document.getElementById('previewType'),
-      applyRound:   document.getElementById('applyRound'),
+      previewType: document.getElementById('previewType'),
+      applyRound:  document.getElementById('applyRound'),
       // 중단(조건)
-      totalRounds:    document.getElementById('totalRounds'),
+      totalRounds: document.getElementById('totalRounds'),
       candidateCount: document.getElementById('candidateCount'),
       nonExposeCount: document.getElementById('nonExposeCount'),
-      runBtn:         document.getElementById('runBtn'),
-      clearLogBtn:    document.getElementById('clearLogBtn'),
+      topKConstraint: document.getElementById('topKConstraint'),
+      // 패턴 필터
+      sumMin: document.getElementById('sumMin'),
+      sumMax: document.getElementById('sumMax'),
+      maxRun: document.getElementById('maxRun'),
+      maxSameEnd: document.getElementById('maxSameEnd'),
+      oddMin: document.getElementById('oddMin'),
+      oddMax: document.getElementById('oddMax'),
+      rollMin: document.getElementById('rollMin'),
+      rollMax: document.getElementById('rollMax'),
+      // 버튼
+      runBtn: document.getElementById('runBtn'),
+      clearLogBtn: document.getElementById('clearLogBtn'),
+      pasteDataBtn: document.getElementById('pasteDataBtn'),
       // 하단
-      summary:      document.getElementById('summary'),
-      table:        document.getElementById('table'),
+      summary: document.getElementById('summary'),
+      table: document.getElementById('table'),
       exposureSets: document.getElementById('exposureSets'),
-      typePanel:    document.getElementById('typePanel'),
-      progress:     document.getElementById('progress')
+      typePanel: document.getElementById('typePanel'),
+      progress: document.getElementById('progress')
     };
-
     try{
       prepareDataOnce();
       if (!el.applyRound.value) el.applyRound.value = ROUND_MAX; // 최신 회차 기본 선택
-      renderDataViewer(); // ✅ 모든 회차 표시
+      renderDataViewer(); // ✅ 모든 회차 표출
     }catch(err){
       console.error(err);
       appendLog("초기 데이터 준비 실패", "err");
     }
-
     // 실행 버튼
     el.runBtn?.addEventListener('click', renderAll);
     // 미리보기 타입 변경 시 패널 포함 갱신
     el.previewType?.addEventListener('change', debounce(renderAll, 120));
+
+    // 데이터 붙여넣기 (서버 없이 운용)
+    el.pasteDataBtn?.addEventListener('click', () => {
+      const hint = '한 줄에 "회차, n1, n2, n3, n4, n5, n6, bonus" (쉼표/공백 모두 허용). 여러 줄 붙여넣기 가능.';
+      const text = window.prompt(`numChosen 데이터 붙여넣기\n\n${hint}\n\n예) 1152, 1 5 9 14 23 38 19`);
+      if (!text) return;
+      const lines = text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+      const out = [];
+      for (const line of lines) {
+        const cols = line.split(/[,\s]+/).map(x=>x.trim()).filter(Boolean).map(Number);
+        if (cols.length >= 7) {
+          const [round, n1,n2,n3,n4,n5,n6, bonus] = cols;
+          if (Number.isFinite(round) && [n1,n2,n3,n4,n5,n6].every(v=>Number.isFinite(v))) {
+            out.push([round,n1,n2,n3,n4,n5,n6, Number.isFinite(bonus)? bonus: 0]);
+          }
+        }
+      }
+      if (!out.length) { appendLog("붙여넣기 실패: 파싱된 행이 없습니다.", "err"); return; }
+      window.numChosen = out;
+      CLEANED = null; ROUND_MIN = null; ROUND_MAX = null;
+      try {
+        prepareDataOnce();
+        if (!el.applyRound.value) el.applyRound.value = ROUND_MAX;
+        renderDataViewer();
+        renderAll();
+        appendLog(`붙여넣기 완료: ${out.length}행`, "ok");
+      } catch (e) {
+        console.error(e);
+        appendLog("붙여넣기 처리 실패", "err");
+      }
+    });
 
     // 최초 1회 실행
     renderAll();
@@ -662,7 +788,6 @@
     const wrap  = document.getElementById('dataViewer');
     const inner = document.getElementById('dataViewerInner');
     if (!wrap || !inner) return;
-
     // 핸들 1회만 생성
     if (!wrap.querySelector('.rd-resize-handle')) {
       const handle = document.createElement('div');
@@ -670,18 +795,15 @@
       wrap.appendChild(handle);
     }
     const handle = wrap.querySelector('.rd-resize-handle');
-
     // 저장 높이 복원 (px 단위, max-height 적용)
     const KEY = 'ui:realdata:maxh';
     const saved = parseInt(localStorage.getItem(KEY), 10);
     if (Number.isFinite(saved) && saved >= 120) {
       inner.style.maxHeight = saved + 'px';
     }
-
     // 드래그 리사이즈
     let dragging = false, sy = 0, sh = 0;
     const MIN_H = 140; // 헤더 + 최소 3~4행 감안
-
     handle.addEventListener('mousedown', (e) => {
       dragging = true;
       sy = e.clientY;
@@ -691,13 +813,11 @@
       document.body.style.cursor = 'row-resize';
       e.preventDefault();
     });
-
     const onMove = (e) => {
       if (!dragging) return;
       const nh = Math.max(MIN_H, sh + (e.clientY - sy));
       inner.style.maxHeight = nh + 'px';
     };
-
     const onUp = () => {
       if (!dragging) return;
       dragging = false;
@@ -707,7 +827,6 @@
         localStorage.setItem(KEY, String(Math.round(nh)));
       }
     };
-
     window.addEventListener('mousemove', onMove);
     window.addEventListener('mouseup', onUp);
   });
